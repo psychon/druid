@@ -20,14 +20,23 @@ use std::cell::{Cell, RefCell};
 use x11rb::connection::Connection;
 use x11rb::errors::{ConnectionError, ReplyError, ReplyOrIdError};
 use x11rb::protocol::xproto::{
-    Atom, AtomEnum, ChangeWindowAttributesAux, ConnectionExt, EventMask, GetPropertyReply,
-    GetPropertyType, Property, SelectionClearEvent, Timestamp, Window, WindowClass,
+    Atom, AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, EventMask, GetPropertyReply,
+    GetPropertyType, Property, PropMode, SelectionClearEvent, SelectionNotifyEvent, SelectionRequestEvent,
+    Timestamp, Window, WindowClass, SELECTION_NOTIFY_EVENT,
 };
 use x11rb::protocol::Event;
 use x11rb::xcb_ffi::XCBConnection;
+use x11rb::wrapper::ConnectionExt as _;
 
 use crate::clipboard::{ClipboardFormat, FormatId};
 use tracing::{error, warn};
+
+x11rb::atom_manager! {
+    ClipboardAtoms: ClipboardAtomsCookie {
+        CLIPBOARD,
+        TARGETS,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Clipboard(Rc<RefCell<ClipboardState>>);
@@ -39,6 +48,10 @@ impl Clipboard {
 
     pub(crate) fn handle_clear(&self, event: &SelectionClearEvent) -> Result<(), ConnectionError> {
         self.0.borrow_mut().handle_clear(event)
+    }
+
+    pub(crate) fn handle_request(&self, event: &SelectionRequestEvent) -> Result<(), ReplyOrIdError> {
+        self.0.borrow_mut().handle_request(event)
     }
 
     pub fn put_string(&mut self, s: impl AsRef<str>) {
@@ -80,7 +93,7 @@ impl Clipboard {
 struct ClipboardContents {
     owner_window: Window,
     timestamp: Timestamp,
-    formats: Vec<Rc<ClipboardFormat>>,
+    data: Vec<(Atom, Rc<Vec<u8>>)>,
 }
 
 impl ClipboardContents {
@@ -99,14 +112,14 @@ impl ClipboardContents {
             x11rb::COPY_FROM_PARENT,
             &Default::default(),
         )?;
-        let formats = formats
+        let data = formats
             .iter()
-            .map(|format| Rc::new(format.clone()))
+            .filter_map(|format| intern_atom(connection, format.identifier).map(|atom| (atom, Rc::new(format.data.clone()))))
             .collect();
         Ok(Self {
             owner_window,
             timestamp,
-            formats,
+            data,
         })
     }
 
@@ -120,18 +133,18 @@ impl ClipboardContents {
 pub struct ClipboardState {
     connection: Rc<XCBConnection>,
     screen_num: usize,
-    clipboard: Atom,
+    atoms: ClipboardAtoms,
     server_timestamp: Rc<Cell<Timestamp>>,
     contents: Option<ClipboardContents>,
 }
 
 impl ClipboardState {
     fn new(connection: Rc<XCBConnection>, screen_num: usize, server_timestamp: Rc<Cell<Timestamp>>) -> Result<Self, ReplyError> {
-        let clipboard = connection.intern_atom(false, b"CLIPBOARD")?.reply()?.atom;
+        let atoms = ClipboardAtoms::new(&*connection)?.reply()?;
         Ok(Self {
             connection,
             screen_num,
-            clipboard,
+            atoms,
             server_timestamp,
             contents: None,
         })
@@ -143,10 +156,10 @@ impl ClipboardState {
         let conn = &*self.connection;
         let contents = ClipboardContents::new(conn, self.screen_num, self.server_timestamp.get(), formats)?;
 
-        conn.set_selection_owner(contents.owner_window, self.clipboard, contents.timestamp)?;
+        conn.set_selection_owner(contents.owner_window, self.atoms.CLIPBOARD, contents.timestamp)?;
 
         // Check if we are the selection owner; this might e.g.fail if our timestamp is too old
-        let owner = conn.get_selection_owner(self.clipboard)?.reply()?;
+        let owner = conn.get_selection_owner(self.atoms.CLIPBOARD)?.reply()?;
         if owner.owner == contents.owner_window {
             // We are the new selection owner! Remember the clipboard contents for later.
             if let Some(mut old_owner) = std::mem::replace(&mut self.contents, Some(contents)) {
@@ -168,4 +181,95 @@ impl ClipboardState {
         }
         Ok(())
     }
+
+    fn handle_request(&self, event: &SelectionRequestEvent) -> Result<(), ReplyOrIdError> {
+        let conn = &*self.connection;
+        let contents = match &self.contents {
+            Some(contents) if contents.owner_window == event.owner => contents,
+            _ => {
+                // Reject the transfer, we do not know what to do with it
+                reject_transfer(conn, event)?;
+                return Ok(());
+            }
+        };
+
+        if event.target == self.atoms.TARGETS {
+            // TARGETS is a special case since it replies with a list of u32
+            let mut atoms = contents
+                .data
+                .iter()
+                .map(|(atom, _)| *atom)
+                .collect::<Vec<_>>();
+            atoms.push(self.atoms.TARGETS);
+            conn.change_property32(
+                PropMode::REPLACE,
+                event.requestor,
+                event.property,
+                AtomEnum::ATOM,
+                &atoms,
+            )?;
+        } else {
+            // Find the requested target
+            let content = contents
+                .data
+                .iter()
+                .find(|(atom, _)| *atom == event.target);
+            match content {
+                None => {
+                    reject_transfer(conn, event)?;
+                    return Ok(());
+                }
+                Some((atom, data)) => {
+                    conn.change_property8(
+                        PropMode::REPLACE,
+                        event.requestor,
+                        event.property,
+                        *atom,
+                        data,
+                    )?;
+                }
+            }
+        }
+
+        // Inform the requestor that we sent the data
+        let event = SelectionNotifyEvent {
+            response_type: SELECTION_NOTIFY_EVENT,
+            sequence: 0,
+            requestor: event.requestor,
+            selection: event.selection,
+            target: event.target,
+            property: event.property,
+            time: event.time,
+        };
+        conn.send_event(false, event.requestor, EventMask::NO_EVENT, &event)?;
+
+        Ok(())
+    }
+}
+
+fn intern_atom(connection: &XCBConnection, name: &str) -> Option<Atom> {
+    fn intern_atom_impl(connection: &XCBConnection, name: &str) -> Result<Atom, ReplyError> {
+        Ok(connection.intern_atom(false, name.as_bytes())?.reply()?.atom)
+    }
+    match intern_atom_impl(connection, name) {
+        Ok(atom) => Some(atom),
+        Err(err) => {
+            error!("Error while interning clipboard atom: {:?}", err);
+            None
+        }
+    }
+}
+
+fn reject_transfer(conn: &XCBConnection, event: &SelectionRequestEvent) -> Result<(), ConnectionError> {
+    let event = SelectionNotifyEvent {
+        response_type: SELECTION_NOTIFY_EVENT,
+        sequence: 0,
+        requestor: event.requestor,
+        selection: event.selection,
+        target: event.target,
+        property: x11rb::NONE,
+        time: event.time,
+    };
+    conn.send_event(false, event.requestor, EventMask::NO_EVENT, &event)?;
+    Ok(())
 }

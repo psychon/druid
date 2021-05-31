@@ -401,6 +401,12 @@ impl Application {
                     .handle_clear(ev)
                     .context("SELECTION_CLEAR event handling")?;
             }
+            Event::SelectionRequest(ev) => {
+                self
+                    .clipboard
+                    .handle_request(ev)
+                    .context("SELECTION_REQUEST event handling")?;
+            }
             Event::Error(e) => {
                 // TODO: if an error is caused by the present extension, disable it and fall back
                 // to copying pixels. This is blocked on
