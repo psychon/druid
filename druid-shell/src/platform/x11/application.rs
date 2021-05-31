@@ -14,7 +14,7 @@
 
 //! X11 implementation of features at the application scope.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
 use std::os::unix::io::RawFd;
@@ -50,6 +50,8 @@ pub(crate) struct Application {
     /// Let's just avoid the issue altogether. As far as public API is concerned, this causes
     /// `druid_shell::WindowHandle` to be `!Send` and `!Sync`.
     marker: std::marker::PhantomData<*mut XCBConnection>,
+    /// The clipboard implementation
+    clipboard: Clipboard,
 
     /// The X11 resource database used to query dpi.
     pub(crate) rdb: Rc<ResourceDb>,
@@ -156,8 +158,12 @@ impl Application {
             col_resize: load_cursor("col-resize"),
         };
 
+        let timestamp = Rc::new(Cell::new(x11rb::CURRENT_TIME));
+        let clipboard = Clipboard::new(Rc::clone(&connection), screen_num, Rc::clone(&timestamp))?;
+
         Ok(Application {
             connection,
+            clipboard,
             rdb,
             screen_num: screen_num as i32,
             window_id,
@@ -520,9 +526,7 @@ impl Application {
     }
 
     pub fn clipboard(&self) -> Clipboard {
-        // TODO(x11/clipboard): implement Application::clipboard
-        tracing::warn!("Application::clipboard is currently unimplemented for X11 platforms.");
-        Clipboard {}
+        self.clipboard.clone()
     }
 
     pub fn get_locale() -> String {
