@@ -407,6 +407,12 @@ impl Application {
                     .handle_request(ev)
                     .context("SELECTION_REQUEST event handling")?;
             }
+            Event::PropertyNotify(ev) => {
+                self
+                    .clipboard
+                    .handle_property_notify(ev)
+                    .context("PROPERTY_NOTIFY event handling")?;
+            }
             Event::Error(e) => {
                 // TODO: if an error is caused by the present extension, disable it and fall back
                 // to copying pixels. This is blocked on

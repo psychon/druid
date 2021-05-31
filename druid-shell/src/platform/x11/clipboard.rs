@@ -14,15 +14,16 @@
 
 //! Interactions with the system pasteboard on X11.
 
-use std::rc::Rc;
 use std::cell::{Cell, RefCell};
+use std::convert::TryFrom;
+use std::rc::Rc;
 
-use x11rb::connection::Connection;
+use x11rb::connection::{Connection, RequestConnection as _};
 use x11rb::errors::{ConnectionError, ReplyError, ReplyOrIdError};
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, ChangeWindowAttributesAux, ConnectionExt as _, EventMask, GetPropertyReply,
-    GetPropertyType, Property, PropMode, SelectionClearEvent, SelectionNotifyEvent, SelectionRequestEvent,
-    Timestamp, Window, WindowClass, SELECTION_NOTIFY_EVENT,
+    GetPropertyType, Property, PropertyNotifyEvent, PropMode, SelectionClearEvent, SelectionNotifyEvent,
+    SelectionRequestEvent, Timestamp, Window, WindowClass, SELECTION_NOTIFY_EVENT,
 };
 use x11rb::protocol::Event;
 use x11rb::xcb_ffi::XCBConnection;
@@ -35,6 +36,7 @@ x11rb::atom_manager! {
     ClipboardAtoms: ClipboardAtomsCookie {
         CLIPBOARD,
         TARGETS,
+        INCR,
     }
 }
 
@@ -52,6 +54,10 @@ impl Clipboard {
 
     pub(crate) fn handle_request(&self, event: &SelectionRequestEvent) -> Result<(), ReplyOrIdError> {
         self.0.borrow_mut().handle_request(event)
+    }
+
+    pub(crate) fn handle_property_notify(&self, event: &PropertyNotifyEvent) -> Result<(), ReplyOrIdError> {
+        self.0.borrow_mut().handle_property_notify(event)
     }
 
     pub fn put_string(&mut self, s: impl AsRef<str>) {
@@ -86,6 +92,59 @@ impl Clipboard {
         // TODO(x11/clipboard): implement Clipboard::available_type_names
         warn!("Clipboard::available_type_names is currently unimplemented for X11 platforms.");
         vec![]
+    }
+}
+
+#[derive(Debug)]
+struct IncrementalTransfer {
+    requestor: Window,
+    selection: Atom,
+    target: Atom,
+    property: Atom,
+    time: Timestamp,
+    data: Rc<Vec<u8>>,
+    data_offset: usize,
+}
+
+impl IncrementalTransfer {
+    fn new(connection: &XCBConnection, event: &SelectionRequestEvent, data: Rc<Vec<u8>>, incr: Atom) -> Result<Self, ConnectionError> {
+        // We need PropertyChangeEvents on the window
+        connection.change_window_attributes(
+            event.requestor,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+        )?;
+        let length = u32::try_from(data.len()).unwrap_or(u32::MAX);
+        connection.change_property32(
+            PropMode::REPLACE,
+            event.requestor,
+            event.property,
+            incr,
+            &[length],
+        )?;
+        Ok(Self {
+            requestor: event.requestor,
+            selection: event.selection,
+            target: event.target,
+            property: event.property,
+            time: event.time,
+            data,
+            data_offset: 0,
+        })
+    }
+
+    // Continue an incremental transfer, returning true if the transfer is finished
+    fn continue_incremental(&mut self, connection: &XCBConnection) -> Result<bool, ConnectionError> {
+        let remaining = &self.data[self.data_offset..];
+        let next_length = remaining.len().min(maximum_property_length(connection));
+        connection.change_property8(
+            PropMode::REPLACE,
+            self.requestor,
+            self.property,
+            self.target,
+            &remaining[..next_length],
+        )?;
+        self.data_offset += next_length;
+        Ok(remaining.is_empty())
     }
 }
 
@@ -136,6 +195,7 @@ pub struct ClipboardState {
     atoms: ClipboardAtoms,
     server_timestamp: Rc<Cell<Timestamp>>,
     contents: Option<ClipboardContents>,
+    incremental: Vec<IncrementalTransfer>,
 }
 
 impl ClipboardState {
@@ -147,6 +207,7 @@ impl ClipboardState {
             atoms,
             server_timestamp,
             contents: None,
+            incremental: Vec::new(),
         })
     }
 
@@ -182,7 +243,7 @@ impl ClipboardState {
         Ok(())
     }
 
-    fn handle_request(&self, event: &SelectionRequestEvent) -> Result<(), ReplyOrIdError> {
+    fn handle_request(&mut self, event: &SelectionRequestEvent) -> Result<(), ReplyOrIdError> {
         let conn = &*self.connection;
         let contents = match &self.contents {
             Some(contents) if contents.owner_window == event.owner => contents,
@@ -220,13 +281,24 @@ impl ClipboardState {
                     return Ok(());
                 }
                 Some((atom, data)) => {
-                    conn.change_property8(
-                        PropMode::REPLACE,
-                        event.requestor,
-                        event.property,
-                        *atom,
-                        data,
-                    )?;
+                    if data.len() > maximum_property_length(conn) {
+                        // We need to do an INCR transfer. Sigh.
+                        self.incremental.push(IncrementalTransfer::new(
+                            conn,
+                            event,
+                            Rc::clone(&data),
+                            self.atoms.INCR,
+                        )?);
+                    } else {
+                        // We can provide the data directly
+                        conn.change_property8(
+                            PropMode::REPLACE,
+                            event.requestor,
+                            event.property,
+                            *atom,
+                            data,
+                        )?;
+                    }
                 }
             }
         }
@@ -245,6 +317,34 @@ impl ClipboardState {
 
         Ok(())
     }
+
+    fn handle_property_notify(&mut self, event: &PropertyNotifyEvent) -> Result<(), ReplyOrIdError> {
+        fn matches(transfer: &IncrementalTransfer, event: &PropertyNotifyEvent) -> bool {
+            transfer.requestor == event.window && transfer.property == event.atom
+        }
+
+        if event.state != Property::DELETE {
+            return Ok(());
+        }
+        if let Some(transfer) = self
+                .incremental
+                .iter_mut()
+                .find(|transfer| matches(transfer, event)) {
+            let done = transfer.continue_incremental(&*self.connection)?;
+            if done {
+                // Transfer is done, remove it
+                self.incremental.retain(|transfer| !matches(transfer, event));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn maximum_property_length(connection: &XCBConnection) -> usize {
+    let change_prop_header_size = 24;
+    // Apply an arbitrary limit to the property size to not stress the server too much
+    let max_request_length = connection.maximum_request_bytes().min(usize::from(u16::MAX));
+    max_request_length - change_prop_header_size
 }
 
 fn intern_atom(connection: &XCBConnection, name: &str) -> Option<Atom> {
