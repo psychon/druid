@@ -21,7 +21,7 @@ use x11rb::connection::Connection;
 use x11rb::errors::{ConnectionError, ReplyError, ReplyOrIdError};
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, ChangeWindowAttributesAux, ConnectionExt, EventMask, GetPropertyReply,
-    GetPropertyType, Property, Timestamp, Window, WindowClass,
+    GetPropertyType, Property, SelectionClearEvent, Timestamp, Window, WindowClass,
 };
 use x11rb::protocol::Event;
 use x11rb::xcb_ffi::XCBConnection;
@@ -35,6 +35,10 @@ pub struct Clipboard(Rc<RefCell<ClipboardState>>);
 impl Clipboard {
     pub(crate) fn new(connection: Rc<XCBConnection>, screen_num: usize, server_timestamp: Rc<Cell<Timestamp>>) -> Result<Self, ReplyError> {
         Ok(Self(Rc::new(RefCell::new(ClipboardState::new(connection, screen_num, server_timestamp)?))))
+    }
+
+    pub(crate) fn handle_clear(&self, event: &SelectionClearEvent) -> Result<(), ConnectionError> {
+        self.0.borrow_mut().handle_clear(event)
     }
 
     pub fn put_string(&mut self, s: impl AsRef<str>) {
@@ -151,6 +155,17 @@ impl ClipboardState {
             }
         }
 
+        Ok(())
+    }
+
+    fn handle_clear(&mut self, event: &SelectionClearEvent) -> Result<(), ConnectionError> {
+        let window = self.contents.as_ref().map(|c| c.owner_window);
+        if Some(event.owner) == window {
+            // We lost ownership of the selection, clean up
+            if let Some(mut contents) = self.contents.take() {
+                contents.destroy(&*self.connection)?;
+            }
+        }
         Ok(())
     }
 }
