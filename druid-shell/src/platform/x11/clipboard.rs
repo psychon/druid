@@ -212,6 +212,7 @@ impl ClipboardState {
     }
 
     // TODO: Remove & destroy() old contents object when no longer needed
+    // TODO: Add tracing::debug!() calls
 
     fn put_formats(&mut self, formats: &[ClipboardFormat]) -> Result<(), ReplyOrIdError> {
         let conn = &*self.connection;
