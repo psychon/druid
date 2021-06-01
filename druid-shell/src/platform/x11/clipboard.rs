@@ -213,6 +213,8 @@ impl ClipboardState {
 
     // TODO: Remove & destroy() old contents object when no longer needed
     // TODO: Add tracing::debug!() calls
+    // TODO: I bet self-transfers will hang (the program asks for the clipboard contents while
+    // owning the selection)
 
     fn put_formats(&mut self, formats: &[ClipboardFormat]) -> Result<(), ReplyOrIdError> {
         let conn = &*self.connection;
